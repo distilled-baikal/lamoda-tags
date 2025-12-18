@@ -5,11 +5,14 @@ Inference utilities for tag prediction model.
 
 import json
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+if TYPE_CHECKING:
+    from model.rerank import LLMReranker
 
 
 def sigmoid(x: np.ndarray) -> np.ndarray:
@@ -187,7 +190,10 @@ class TagPredictor:
         text: str,
         good_type: Optional[str] = None,
         use_per_label_threshold: bool = True,
-        return_probs: bool = False
+        return_probs: bool = False,
+        llm_reranker: Optional["LLMReranker"] = None,
+        rerank_top_n: int = 20,
+        rerank_max_output: Optional[int] = None,
     ) -> List[Tuple[str, float]]:
         """
         Predict tags for text.
@@ -197,6 +203,9 @@ class TagPredictor:
             good_type: Product category for filtering allowed tags
             use_per_label_threshold: Use per-label thresholds (True) or global (False)
             return_probs: Include probabilities in output
+            llm_reranker: Optional LLM reranker instance
+            rerank_top_n: Number of candidates from model to pass to LLM
+            rerank_max_output: Cap for number of tags returned by LLM
             
         Returns:
             List of (tag, probability) tuples, sorted by probability descending
@@ -213,6 +222,23 @@ class TagPredictor:
         if good_type:
             mask = self._get_allowed_mask(good_type)
             probs = probs * mask
+
+        if llm_reranker is not None:
+            top_n = max(1, min(int(rerank_top_n), len(self.labels)))
+            candidate_idx = np.argsort(-probs)[:top_n]
+            candidates = [(self.labels[j], float(probs[j])) for j in candidate_idx if probs[j] > 0]
+            if candidates:
+                try:
+                    reranked = llm_reranker.rerank(
+                        text=text,
+                        good_type=good_type,
+                        candidates=candidates,
+                        max_return=rerank_max_output or self.top_k,
+                    )
+                except Exception:
+                    reranked = []
+                if reranked:
+                    return reranked
         
         if use_per_label_threshold:
             preds = (probs >= self.per_label_thresholds).astype(int)
@@ -232,7 +258,10 @@ class TagPredictor:
         self,
         texts: List[str],
         good_types: Optional[List[str]] = None,
-        use_per_label_threshold: bool = True
+        use_per_label_threshold: bool = True,
+        llm_reranker: Optional["LLMReranker"] = None,
+        rerank_top_n: int = 20,
+        rerank_max_output: Optional[int] = None,
     ) -> List[List[Tuple[str, float]]]:
         """
         Predict tags for multiple texts.
@@ -241,6 +270,9 @@ class TagPredictor:
             texts: List of input texts
             good_types: List of product categories (same length as texts)
             use_per_label_threshold: Use per-label thresholds
+            llm_reranker: Optional LLM reranker instance
+            rerank_top_n: Number of candidates sent to reranker
+            rerank_max_output: Limit on reranker output size
             
         Returns:
             List of predictions, one per input text
@@ -249,7 +281,14 @@ class TagPredictor:
             good_types = [None] * len(texts)
         
         return [
-            self.predict(text, good_type, use_per_label_threshold)
+            self.predict(
+                text,
+                good_type,
+                use_per_label_threshold=use_per_label_threshold,
+                llm_reranker=llm_reranker,
+                rerank_top_n=rerank_top_n,
+                rerank_max_output=rerank_max_output,
+            )
             for text, good_type in zip(texts, good_types)
         ]
 
@@ -263,13 +302,27 @@ def main():
     parser.add_argument("--artifacts", default="model/artifacts", help="Path to artifacts")
     parser.add_argument("--text", required=True, help="Product text (name + reviews)")
     parser.add_argument("--good-type", default=None, help="Product category")
+    parser.add_argument("--llm-rerank", action="store_true", help="Use LLM reranker on top-20 model tags")
+    parser.add_argument("--rerank-top-n", type=int, default=20, help="Number of model tags to send to LLM")
+    parser.add_argument("--rerank-max-output", type=int, default=5, help="Max tags to keep after rerank")
     args = parser.parse_args()
     
     predictor = TagPredictor.load(args.model, args.artifacts)
+
+    reranker = None
+    if args.llm_rerank:
+        from model.rerank import LLMReranker
+        try:
+            reranker = LLMReranker.from_env(max_return=args.rerank_max_output)
+        except Exception as exc:
+            raise SystemExit(f"Failed to initialize LLM reranker: {exc}")
     
     tags = predictor.predict(
         text=args.text,
-        good_type=args.good_type
+        good_type=args.good_type,
+        llm_reranker=reranker,
+        rerank_top_n=args.rerank_top_n,
+        rerank_max_output=args.rerank_max_output,
     )
     
     print("Predicted tags:")
@@ -279,4 +332,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
