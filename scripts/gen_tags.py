@@ -16,18 +16,15 @@ import warnings
 import asyncio
 from asyncio import Semaphore
 
-# Disable SSL warnings for corporate proxy
 warnings.filterwarnings('ignore', message='Unverified HTTPS request')
 warnings.filterwarnings('ignore', category=UserWarning, module='httpx')
 
 
-# Configuration from mvp.ipynb
 BASE_URL = os.getenv("OPENAI_BASE_URL", "")
 API_KEY = os.getenv("OPENAI_TOKEN", "")
 MODEL = os.getenv("OPENAI_MODEL", "")
 
-# Chunking settings - approximate tokens (1 token ≈ 4 chars)
-MAX_CHARS_PER_CHUNK = 600000  # Conservative estimate for ~2000 tokens
+MAX_CHARS_PER_CHUNK = 600000
 
 
 def chunk_reviews(reviews: List[str], max_chars: int = MAX_CHARS_PER_CHUNK) -> List[List[str]]:
@@ -73,14 +70,12 @@ def extract_tags_from_response(response: str) -> str:
     if not response or not response.strip():
         return ""
     
-    # Extract JSON from code blocks (like mvp.ipynb)
     pattern_json = re.compile(r"```json\s*([\s\S]*?)\s*```", re.IGNORECASE)
     matches = pattern_json.findall(response)
     
     if matches:
         json_text = matches[-1]
     else:
-        # Try to find JSON object directly
         json_match = re.search(r'\{[\s\S]*\}', response)
         if json_match:
             json_text = json_match.group(0)
@@ -94,7 +89,6 @@ def extract_tags_from_response(response: str) -> str:
         if not isinstance(tags_list, list):
             return ""
         
-        # Return all tags, joined by semicolon (no limit)
         tags = [str(tag).strip() for tag in tags_list if tag and str(tag).strip()]
         return '; '.join(tags)
         
@@ -157,7 +151,6 @@ async def generate_tags_for_product(
 
 Важно: теги должны быть на русском языке и отражать реальные характеристики товара из отзывов."""
     
-    # Prepare reviews text
     reviews_text = "\n".join([f"{i+1}. {review}" for i, review in enumerate(reviews)])
     
     user_prompt = f"""Товар: {product_name}
@@ -188,7 +181,6 @@ async def generate_tags_for_product(
     
     tags = extract_tags_from_response(response)
     
-    # Show tags in output
     if tags:
         print(f"  → Tags: {tags}")
     else:
@@ -208,10 +200,8 @@ async def generate_tags_for_product_chunked(
     chunks = chunk_reviews(reviews, MAX_CHARS_PER_CHUNK)
     
     if len(chunks) == 1:
-        # Single chunk, use regular function
         return await generate_tags_for_product(client, product_name, reviews, good_type, good_subtype)
     
-    # Multiple chunks - generate tags for each chunk, then combine
     all_tags = []
     
     for i, chunk in enumerate(chunks):
@@ -225,7 +215,6 @@ async def generate_tags_for_product_chunked(
         if chunk_tags:
             all_tags.extend(chunk_tags.split('; '))
     
-    # Deduplicate tags (no limit on quantity)
     unique_tags = []
     seen = set()
     for tag in all_tags:
@@ -250,7 +239,6 @@ async def process_product(
     async with semaphore:
         product_sku = product_row['product_sku']
         
-        # Skip if tags already exist for this product (and not failed)
         if not reset_failed:
             async with lock:
                 product_tags = df[df['product_sku'] == product_sku]['tags']
@@ -259,29 +247,22 @@ async def process_product(
                     if first_tag and first_tag.strip() and first_tag.strip() != '[FAILED]':
                         return (product_sku, None)
         
-        # Get all reviews for this product
-        # comment_text is now a JSON array string, need to parse it
         async with lock:
             product_row_data = df[df['product_sku'] == product_sku].iloc[0]
             comment_text_str = product_row_data['comment_text']
         
-        # Parse JSON array from comment_text
         try:
             if pd.isna(comment_text_str) or not comment_text_str:
                 return (product_sku, None)
             
-            # Try to parse as JSON array
             reviews_list = json.loads(comment_text_str)
             if not isinstance(reviews_list, list):
-                reviews_list = [comment_text_str]  # Fallback: treat as single review
+                reviews_list = [comment_text_str]
         except (json.JSONDecodeError, TypeError):
-            # If not JSON, treat as single review string
             reviews_list = [str(comment_text_str)] if comment_text_str else []
         
-        # Filter out empty reviews
         reviews_list = [str(r).strip() for r in reviews_list if r and str(r).strip()]
         
-        # Skip if no reviews
         if not reviews_list:
             return (product_sku, None)
         
@@ -289,10 +270,8 @@ async def process_product(
         good_type = product_row['good_type']
         good_subtype = product_row['good_subtype']
         
-        # Show product being processed
         print(f"\n{product_name} ({product_sku})")
         
-        # Generate tags
         try:
             if len(' '.join(reviews_list)) > MAX_CHARS_PER_CHUNK:
                 tags = await generate_tags_for_product_chunked(
@@ -313,25 +292,20 @@ async def process_product(
 async def main_async():
     import sys
     
-    # Check for test mode
     test_mode = '--test' in sys.argv
     reset_failed = '--reset-failed' in sys.argv
-    max_concurrent = int(os.getenv("MAX_CONCURRENT", "2"))  # Max concurrent requests
+    max_concurrent = int(os.getenv("MAX_CONCURRENT", "2"))
     
-    # Paths
     project_root = Path(__file__).parent.parent
     input_file = project_root / "lamoda_reviews_sampled.csv"
     output_file = project_root / "lamoda_reviews_sampled_with_tags.csv"
     
-    # Load existing output file if it exists, otherwise start from input
     if output_file.exists():
         print(f"Loading existing data from {output_file}...")
         df = pd.read_csv(output_file, encoding='utf-8')
         if 'tags' not in df.columns:
             df['tags'] = ''
-        # Replace NaN with empty string
         df['tags'] = df['tags'].fillna('')
-        # Count products with valid tags (not empty and not failed)
         valid_tags = df[(df['tags'] != '') & (df['tags'] != '[FAILED]')]
         print(f"Resuming: {valid_tags['product_sku'].nunique()} products already have tags")
     else:
@@ -339,19 +313,15 @@ async def main_async():
         df = pd.read_csv(input_file, encoding='utf-8')
         df['tags'] = ''
     
-    # Initialize AsyncOpenAI client with SSL verification disabled (for corporate proxy)
     http_client = httpx.AsyncClient(verify=False)
     client = AsyncOpenAI(base_url=BASE_URL, api_key=API_KEY, http_client=http_client)
     
-    # Get unique products
     products = df.groupby('product_sku').first().reset_index()
     
-    # Reset failed tags if requested
     if reset_failed:
         df.loc[df['tags'] == '[FAILED]', 'tags'] = ''
         print("Reset all failed tags")
     
-    # Limit to first 5 products in test mode
     if test_mode:
         products = products.head(5)
         print("TEST MODE: Processing only first 5 products")
@@ -360,28 +330,22 @@ async def main_async():
     print(f"Max concurrent requests: {max_concurrent}")
     print(f"Output will be saved to {output_file}")
     
-    # Create semaphore to limit concurrent requests and lock for thread-safe DataFrame access
     semaphore = Semaphore(max_concurrent)
     lock = asyncio.Lock()
     
-    # Process products in batches with progress tracking
     tasks = []
     for idx, product_row in products.iterrows():
         task = process_product(client, df, product_row, {}, lock, semaphore, reset_failed)
         tasks.append(task)
     
-    # Process all tasks with progress bar
     results = await async_tqdm.gather(*tasks, desc="Generating tags")
     
-    # Update DataFrame with results
     for product_sku, tags in results:
         if tags is not None:
             df.loc[df['product_sku'] == product_sku, 'tags'] = tags
     
-    # Save final results with UTF-8 encoding for Russian text
     df.to_csv(output_file, index=False, encoding='utf-8')
     
-    # Close HTTP client
     await http_client.aclose()
     
     print(f"\nDone! Results saved to {output_file}")
