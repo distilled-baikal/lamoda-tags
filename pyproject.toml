@@ -1,0 +1,11 @@
+[project]
+name = "lamoda-tags"
+version = "0.1.0"
+description = "lamoda tags"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "pandas",
+    "openai",
+    "tqdm",
+]
