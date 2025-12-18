@@ -11,7 +11,6 @@ import json
 MAX_ROWS_PER_TYPE = 10000
 
 def main():
-    # Paths
     project_root = Path(__file__).parent.parent
     input_file = project_root / "lamoda_reviews.csv"
     output_file = project_root / "lamoda_reviews_sampled.csv"
@@ -23,7 +22,6 @@ def main():
     print(f"\nOriginal distribution by good_type:")
     print(df['good_type'].value_counts().sort_index())
     
-    # Sample up to MAX_ROWS_PER_TYPE rows for each good_type
     sampled_dfs = []
     for good_type in df['good_type'].unique():
         type_df = df[df['good_type'] == good_type]
@@ -38,20 +36,16 @@ def main():
         
         sampled_dfs.append(sampled)
     
-    # Combine all sampled dataframes
     result_df = pd.concat(sampled_dfs, ignore_index=True)
     
-    # Group by product_sku and aggregate all reviews into one array per product
     print(f"\nGrouping reviews by product...")
     grouped = result_df.groupby('product_sku').agg({
         'comment_id': list,
-        'comment_text': list,  # All reviews for one product in one array
-        'name': 'first',
+        'comment_text': list,
         'good_type': 'first',
         'good_subtype': 'first'
     }).reset_index()
     
-    # Filter to only include products with 4 or more reviews
     print(f"\nFiltering products with 4 or more reviews...")
     grouped['review_count'] = grouped['comment_text'].apply(len)
     filtered_grouped = grouped[grouped['review_count'] >= 4].copy()
@@ -59,13 +53,11 @@ def main():
     
     print(f"Products after filtering: {len(filtered_grouped):,} (removed {len(grouped) - len(filtered_grouped):,} products)")
     
-    # Convert lists to JSON strings for CSV storage (ensure_ascii=False for Russian text)
     filtered_grouped['comment_id'] = filtered_grouped['comment_id'].apply(lambda x: json.dumps(x, ensure_ascii=False))
     filtered_grouped['comment_text'] = filtered_grouped['comment_text'].apply(lambda x: json.dumps(x, ensure_ascii=False))
     
     result_df = filtered_grouped
     
-    # Shuffle the final dataframe
     result_df = result_df.sample(frac=1, random_state=42).reset_index(drop=True)
     
     print(f"\nFinal distribution by good_type:")
@@ -73,7 +65,6 @@ def main():
     print(f"\nTotal rows in output: {len(result_df):,}")
     print(f"Unique products: {result_df['product_sku'].nunique():,}")
     
-    # Save to CSV with UTF-8 encoding for Russian text
     print(f"\nSaving to {output_file}...")
     result_df.to_csv(output_file, index=False, encoding='utf-8')
     print("Done!")

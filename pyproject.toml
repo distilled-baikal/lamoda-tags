@@ -9,3 +9,6 @@ dependencies = [
     "openai",
     "tqdm",
 ]
+
+[tool.uv]
+index-url = "https://pypi.org/simple"
