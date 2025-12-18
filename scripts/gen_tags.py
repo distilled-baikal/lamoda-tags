@@ -27,7 +27,7 @@ API_KEY = os.getenv("OPENAI_TOKEN", "")
 MODEL = os.getenv("OPENAI_MODEL", "")
 
 # Chunking settings - approximate tokens (1 token ≈ 4 chars)
-MAX_CHARS_PER_CHUNK = 800000  # Conservative estimate for ~2000 tokens
+MAX_CHARS_PER_CHUNK = 600000  # Conservative estimate for ~2000 tokens
 
 
 def chunk_reviews(reviews: List[str], max_chars: int = MAX_CHARS_PER_CHUNK) -> List[List[str]]:
@@ -260,9 +260,26 @@ async def process_product(
                         return (product_sku, None)
         
         # Get all reviews for this product
+        # comment_text is now a JSON array string, need to parse it
         async with lock:
-            product_reviews = df[df['product_sku'] == product_sku]
-            reviews_list = product_reviews['comment_text'].dropna().tolist()
+            product_row_data = df[df['product_sku'] == product_sku].iloc[0]
+            comment_text_str = product_row_data['comment_text']
+        
+        # Parse JSON array from comment_text
+        try:
+            if pd.isna(comment_text_str) or not comment_text_str:
+                return (product_sku, None)
+            
+            # Try to parse as JSON array
+            reviews_list = json.loads(comment_text_str)
+            if not isinstance(reviews_list, list):
+                reviews_list = [comment_text_str]  # Fallback: treat as single review
+        except (json.JSONDecodeError, TypeError):
+            # If not JSON, treat as single review string
+            reviews_list = [str(comment_text_str)] if comment_text_str else []
+        
+        # Filter out empty reviews
+        reviews_list = [str(r).strip() for r in reviews_list if r and str(r).strip()]
         
         # Skip if no reviews
         if not reviews_list:
@@ -299,7 +316,7 @@ async def main_async():
     # Check for test mode
     test_mode = '--test' in sys.argv
     reset_failed = '--reset-failed' in sys.argv
-    max_concurrent = int(os.getenv("MAX_CONCURRENT", "5"))  # Max concurrent requests
+    max_concurrent = int(os.getenv("MAX_CONCURRENT", "3"))  # Max concurrent requests
     
     # Paths
     project_root = Path(__file__).parent.parent
@@ -309,7 +326,7 @@ async def main_async():
     # Load existing output file if it exists, otherwise start from input
     if output_file.exists():
         print(f"Loading existing data from {output_file}...")
-        df = pd.read_csv(output_file)
+        df = pd.read_csv(output_file, encoding='utf-8')
         if 'tags' not in df.columns:
             df['tags'] = ''
         # Replace NaN with empty string
@@ -319,7 +336,7 @@ async def main_async():
         print(f"Resuming: {valid_tags['product_sku'].nunique()} products already have tags")
     else:
         print(f"Reading data from {input_file}...")
-        df = pd.read_csv(input_file)
+        df = pd.read_csv(input_file, encoding='utf-8')
         df['tags'] = ''
     
     # Initialize AsyncOpenAI client with SSL verification disabled (for corporate proxy)
@@ -361,8 +378,8 @@ async def main_async():
         if tags is not None:
             df.loc[df['product_sku'] == product_sku, 'tags'] = tags
     
-    # Save final results
-    df.to_csv(output_file, index=False)
+    # Save final results with UTF-8 encoding for Russian text
+    df.to_csv(output_file, index=False, encoding='utf-8')
     
     # Close HTTP client
     await http_client.aclose()
