@@ -18,6 +18,8 @@ import warnings
 import asyncio
 from sklearn.cluster import AgglomerativeClustering
 from sklearn.metrics.pairwise import cosine_similarity
+from tqdm.asyncio import tqdm as atqdm
+from tqdm import tqdm
 
 warnings.filterwarnings('ignore', message='Unverified HTTPS request')
 warnings.filterwarnings('ignore', category=UserWarning, module='httpx')
@@ -27,7 +29,7 @@ API_KEY = os.getenv("OPENAI_TOKEN", "")
 MODEL = os.getenv("OPENAI_MODEL", "")
 EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-qwen3-embedding-0.6b")
 
-SIMILARITY_THRESHOLD = 0.85
+SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.91"))
 
 
 async def get_embeddings(client: AsyncOpenAI, texts: List[str], model: str = EMBED_MODEL) -> np.ndarray:
@@ -136,7 +138,7 @@ async def consolidate_tag_cluster(client: AsyncOpenAI, cluster: List[str], good_
     
     response = await call_llm(client, messages)
     data = extract_json_from_response(response)
-    best_tag = data.get("best_tag", "").strip()
+    best_tag = data.get("best_tag", "").strip().lower()
     
     return best_tag, cluster
 
@@ -192,13 +194,13 @@ mappings должен содержать ВСЕ исходные теги - ли
     response = await call_llm(client, messages)
     data = extract_json_from_response(response)
     
-    kept_tags = data.get("kept_tags", [])
+    kept_tags = [tag.strip().lower() for tag in data.get("kept_tags", []) if tag.strip()]
     raw_mappings = data.get("mappings", [])
     
     mappings = []
     for m in raw_mappings:
-        old_tags = m.get("old", [])
-        new_tag = m.get("new", "")
+        old_tags = [tag.strip().lower() for tag in m.get("old", []) if tag.strip()]
+        new_tag = m.get("new", "").strip().lower()
         if old_tags:
             mappings.append((old_tags, new_tag))
     
@@ -208,27 +210,33 @@ mappings должен содержать ВСЕ исходные теги - ли
 async def process_good_type(
     client: AsyncOpenAI,
     good_type: str,
-    tags: List[str]
+    tags: List[str],
+    pbar: tqdm = None
 ) -> Tuple[List[str], List[Tuple[List[str], str]]]:
     """Process tags for a single good_type."""
-    print(f"\n=== {good_type} ({len(tags)} tags) ===")
+    if pbar:
+        pbar.set_description(f"Processing {good_type[:30]}")
     
-    print("  Getting embeddings...")
     embeddings = await get_embeddings(client, tags)
     
-    print("  Clustering similar tags...")
     clusters = cluster_similar_tags(tags, embeddings)
-    print(f"  Found {len(clusters)} clusters")
     
-    print("  Consolidating clusters...")
     consolidated_tags = []
     cluster_mappings = []
     
-    for cluster in clusters:
-        if len(cluster) == 1:
-            consolidated_tags.append(cluster[0])
-        else:
-            best_tag, original_tags = await consolidate_tag_cluster(client, cluster, good_type)
+    clusters_to_process = [c for c in clusters if len(c) > 1]
+    if clusters_to_process:
+        cluster_tasks = [
+            consolidate_tag_cluster(client, cluster, good_type)
+            for cluster in clusters_to_process
+        ]
+        cluster_results = await atqdm.gather(
+            *cluster_tasks,
+            desc=f"  Consolidating {len(clusters_to_process)} clusters",
+            leave=False
+        )
+        
+        for best_tag, original_tags in cluster_results:
             if best_tag:
                 consolidated_tags.append(best_tag)
                 if best_tag not in original_tags:
@@ -238,15 +246,19 @@ async def process_good_type(
                     if others:
                         cluster_mappings.append((others, best_tag))
     
-    print(f"  After clustering: {len(consolidated_tags)} tags")
+    for cluster in clusters:
+        if len(cluster) == 1:
+            consolidated_tags.append(cluster[0])
     
-    print("  Final filtering...")
     final_tags, llm_mappings = await filter_and_select_best_tags(client, consolidated_tags, good_type)
     
     all_mappings = cluster_mappings + llm_mappings
     
-    print(f"  Final: {len(final_tags)} tags")
-    print(f"  Mappings: {len(all_mappings)}")
+    if pbar:
+        pbar.set_postfix({
+            'tags': f"{len(tags)}→{len(final_tags)}",
+            'clusters': len(clusters)
+        })
     
     return final_tags, all_mappings
 
@@ -258,6 +270,7 @@ async def main_async():
     output_mappings_file = project_root / "tag_mappings.csv"
     
     print(f"Reading data from {input_file}...")
+    print(f"Similarity threshold: {SIMILARITY_THRESHOLD}")
     df = pd.read_csv(input_file, encoding='utf-8')
     
     http_client = httpx.AsyncClient(verify=False)
@@ -266,6 +279,7 @@ async def main_async():
     all_best_tags = {}
     all_mappings = []
     
+    good_types_to_process = []
     for _, row in df.iterrows():
         good_type = row['good_type']
         tags_str = row['tags']
@@ -273,34 +287,41 @@ async def main_async():
         if pd.isna(tags_str) or not tags_str.strip():
             continue
         
-        tags = [t.strip() for t in tags_str.split(';') if t.strip()]
+        tags = [t.strip().lower() for t in tags_str.split(';') if t.strip()]
         
         if not tags:
             continue
         
-        best_tags, mappings = await process_good_type(client, good_type, tags)
-        all_best_tags[good_type] = best_tags
-        
-        for old_tags, new_tag in mappings:
-            all_mappings.append({
-                "good_type": good_type,
-                "old_tags": "; ".join(old_tags),
-                "new_tag": new_tag
-            })
+        good_types_to_process.append((good_type, tags))
+    
+    with tqdm(total=len(good_types_to_process), desc="Processing good types", unit="type") as pbar:
+        for good_type, tags in good_types_to_process:
+            best_tags, mappings = await process_good_type(client, good_type, tags, pbar)
+            all_best_tags[good_type] = best_tags
+            
+            for old_tags, new_tag in mappings:
+                all_mappings.append({
+                    "good_type": good_type,
+                    "old_tags": "; ".join(old_tags),
+                    "new_tag": new_tag
+                })
+            
+            pbar.update(1)
     
     await http_client.aclose()
     
+    print(f"\nSaving results...")
     rows = [{"good_type": gt, "tags": "; ".join(tags)} for gt, tags in sorted(all_best_tags.items())]
     pd.DataFrame(rows).to_csv(output_tags_file, index=False, encoding='utf-8')
-    print(f"\nSaved best tags to {output_tags_file}")
+    print(f"✓ Saved best tags to {output_tags_file}")
     
     pd.DataFrame(all_mappings).to_csv(output_mappings_file, index=False, encoding='utf-8')
-    print(f"Saved mappings to {output_mappings_file}")
+    print(f"✓ Saved mappings to {output_mappings_file}")
     
     print("\n=== Summary ===")
     for gt, tags in sorted(all_best_tags.items()):
         original_count = len([t.strip() for t in df[df['good_type'] == gt]['tags'].iloc[0].split(';') if t.strip()])
-        print(f"{gt}: {original_count} -> {len(tags)} tags")
+        print(f"{gt}: {original_count} → {len(tags)} tags")
 
 
 def main():
