@@ -4,13 +4,14 @@ Simple Streamlit UI for exploring Lamoda products and model tags.
 """
 
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import pandas as pd
 import streamlit as st
 
 from model.data import build_text, parse_pylist_or_json, parse_tags_semicolon
 from model.predict import TagPredictor
+from model.rerank import LLMReranker
 
 DATA_PATH = Path("lamoda_reviews_sampled_with_pull_tags.csv")
 MODEL_DIR = Path("model/output/best_model")
@@ -42,6 +43,11 @@ def load_predictor(model_dir: Path, artifacts_dir: Path) -> TagPredictor:
     return TagPredictor.load(model_dir, artifacts_dir, device="cpu")
 
 
+@st.cache_resource(show_spinner=False)
+def load_reranker() -> LLMReranker:
+    return LLMReranker.from_env()
+
+
 def render_tag_list(title: str, tags: List[str]) -> None:
     st.markdown(f"**{title}**")
     if tags:
@@ -54,6 +60,19 @@ def main():
     st.set_page_config(page_title="Lamoda Tags Explorer", layout="wide")
     st.title("Lamoda Tags Explorer")
     st.caption("Выберите товар, просмотрите отзывы и посмотрите теги модели.")
+
+    with st.sidebar:
+        use_llm = st.checkbox("LLM rerank (top-20)", value=False, help="Требуются OPENAI_* переменные")
+        st.caption("LLM сверяет top-20 тегов с отзывами и оставляет только релевантные.")
+        reranker: Optional[LLMReranker] = None
+        if use_llm:
+            try:
+                reranker = load_reranker()
+            except Exception as exc:
+                st.error(f"LLM rerank недоступен: {exc}")
+                reranker = None
+        else:
+            reranker = None
 
     if not DATA_PATH.exists():
         st.error(f"Не найден файл данных: {DATA_PATH}")
@@ -80,7 +99,13 @@ def main():
         st.error(f"Не удалось загрузить модель: {exc}")
         return
 
-    preds = predictor.predict(product["text"], product["good_type"])
+    preds = predictor.predict(
+        product["text"],
+        product["good_type"],
+        llm_reranker=reranker,
+        rerank_top_n=20,
+        rerank_max_output=5,
+    )
 
     col1, col2 = st.columns(2)
     with col1:
