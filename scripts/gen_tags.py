@@ -316,7 +316,7 @@ async def main_async():
     # Check for test mode
     test_mode = '--test' in sys.argv
     reset_failed = '--reset-failed' in sys.argv
-    max_concurrent = int(os.getenv("MAX_CONCURRENT", "3"))  # Max concurrent requests
+    max_concurrent = int(os.getenv("MAX_CONCURRENT", "2"))  # Max concurrent requests
     
     # Paths
     project_root = Path(__file__).parent.parent
