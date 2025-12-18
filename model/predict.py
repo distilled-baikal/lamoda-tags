@@ -20,6 +20,11 @@ def sigmoid(x: np.ndarray) -> np.ndarray:
         np.exp(x) / (1 + np.exp(x))
     )
 
+def logit(p: np.ndarray) -> np.ndarray:
+    """Inverse sigmoid with clipping for numerical stability."""
+    p = np.clip(p, 1e-6, 1 - 1e-6)
+    return np.log(p / (1 - p))
+
 
 class TagPredictor:
     """
@@ -41,6 +46,8 @@ class TagPredictor:
         global_threshold: float,
         per_label_thresholds: np.ndarray,
         allowed_tags_by_type: Dict[str, Set[str]],
+        prior_logits_by_type: Optional[Dict[str, np.ndarray]] = None,
+        category_prior_weight: float = 0.0,
         max_length: int = 256,
         stride: int = 128,
         top_k: int = 8,
@@ -52,6 +59,8 @@ class TagPredictor:
         self.global_threshold = global_threshold
         self.per_label_thresholds = per_label_thresholds
         self.allowed_tags_by_type = allowed_tags_by_type
+        self.prior_logits_by_type = prior_logits_by_type or {}
+        self.category_prior_weight = float(category_prior_weight or 0.0)
         self.max_length = max_length
         self.stride = stride
         self.top_k = top_k
@@ -96,6 +105,17 @@ class TagPredictor:
         with open(artifacts_path / "allowed_tags_by_type.json", "r", encoding="utf-8") as f:
             allowed_tags_raw = json.load(f)
         allowed_tags_by_type = {k: set(v) for k, v in allowed_tags_raw.items()}
+
+        prior_logits_by_type: Dict[str, np.ndarray] = {}
+        prior_path = artifacts_path / "category_prior_logits.json"
+        if prior_path.exists():
+            prior_data = json.loads(prior_path.read_text(encoding="utf-8"))
+            raw = prior_data.get("prior_logits_by_type", {}) or {}
+            for gt, logits_list in raw.items():
+                try:
+                    prior_logits_by_type[str(gt)] = np.asarray(logits_list, dtype=np.float32)
+                except Exception:
+                    continue
         
         config_path = artifacts_path / "config.json"
         if config_path.exists():
@@ -104,8 +124,10 @@ class TagPredictor:
             max_length = config.get("max_length", 256)
             stride = config.get("stride", 128)
             top_k = config.get("top_k", 8)
+            category_prior_weight = config.get("category_prior_weight", 0.0)
         else:
             max_length, stride, top_k = 256, 128, 8
+            category_prior_weight = 0.0
         
         return cls(
             model=model,
@@ -114,6 +136,8 @@ class TagPredictor:
             global_threshold=global_threshold,
             per_label_thresholds=per_label_thresholds,
             allowed_tags_by_type=allowed_tags_by_type,
+            prior_logits_by_type=prior_logits_by_type,
+            category_prior_weight=category_prior_weight,
             max_length=max_length,
             stride=stride,
             top_k=top_k,
@@ -178,7 +202,14 @@ class TagPredictor:
             List of (tag, probability) tuples, sorted by probability descending
         """
         probs = self.predict_probs(text)
-        
+
+        # Apply per-good_type prior in logit space (guarantees good_type influence)
+        if good_type and self.category_prior_weight > 0:
+            prior_logits = self.prior_logits_by_type.get(str(good_type).strip())
+            if prior_logits is not None and len(prior_logits) == len(self.labels):
+                probs = sigmoid(logit(probs) + self.category_prior_weight * prior_logits)
+
+        # Apply allow-list mask (hard constraint)
         if good_type:
             mask = self._get_allowed_mask(good_type)
             probs = probs * mask

@@ -22,6 +22,9 @@ dependencies = [
     
     # Utilities
     "tqdm>=4.66",
+    
+    # Apps
+    "streamlit>=1.35",
 ]
 
 [project.optional-dependencies]

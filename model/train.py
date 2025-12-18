@@ -40,6 +40,12 @@ def sigmoid(x: np.ndarray) -> np.ndarray:
     )
 
 
+def logit(p: np.ndarray) -> np.ndarray:
+    """Inverse sigmoid with clipping for numerical stability."""
+    p = np.clip(p, 1e-6, 1 - 1e-6)
+    return np.log(p / (1 - p))
+
+
 class CustomTrainer(Trainer):
     """Trainer with custom loss function support."""
     
@@ -135,22 +141,26 @@ def predict_probs_by_sku(trainer: Trainer, ds, num_labels: int):
     return sku_list, probs_by_sku
 
 
-def apply_thresholds(
+def threshold_predictions(
     probs: np.ndarray,
     global_thr: Optional[float] = None,
     per_label_thr: Optional[np.ndarray] = None,
-    top_k: int = 8
 ) -> np.ndarray:
-    """Apply thresholds and ensure at least 1, at most top_k predictions."""
+    """Binarize probabilities using either global or per-label thresholds."""
     n, L = probs.shape
-    
     if per_label_thr is not None:
         thr = np.asarray(per_label_thr).reshape(1, L)
         preds = (probs >= thr).astype(int)
     else:
         thr = 0.35 if global_thr is None else float(global_thr)
         preds = (probs >= thr).astype(int)
-    
+    return preds
+
+
+def enforce_top_k(preds: np.ndarray, probs: np.ndarray, top_k: int = 8) -> np.ndarray:
+    """Ensure predictions contain at least 1 and at most top_k tags per sample."""
+    n = preds.shape[0]
+    preds = preds.copy()
     for i in range(n):
         idx = np.where(preds[i] == 1)[0]
         if len(idx) > top_k:
@@ -162,7 +172,106 @@ def apply_thresholds(
             # Ensure at least one prediction
             best = probs[i].argsort()[-1:]
             preds[i, best] = 1
-    
+    return preds
+
+
+def apply_thresholds(
+    probs: np.ndarray,
+    global_thr: Optional[float] = None,
+    per_label_thr: Optional[np.ndarray] = None,
+    top_k: int = 8
+) -> np.ndarray:
+    """Apply thresholds and enforce inference-time constraints."""
+    preds = threshold_predictions(probs, global_thr=global_thr, per_label_thr=per_label_thr)
+    return enforce_top_k(preds, probs, top_k=top_k)
+
+
+def avg_predicted_tags(preds: np.ndarray) -> float:
+    """Average number of predicted tags per sample."""
+    if preds.size == 0:
+        return 0.0
+    return float(preds.sum(axis=1).mean())
+
+
+def compute_category_label_stats(train_df: pd.DataFrame) -> Tuple[Dict[str, Dict[str, np.ndarray]], np.ndarray, int]:
+    """Aggregate positive counts per label for each good_type."""
+    stats: Dict[str, Dict[str, np.ndarray]] = {}
+    num_labels = len(train_df["labels"].iloc[0])
+    global_pos = np.zeros(num_labels, dtype=np.float32)
+    for gt, group in train_df.groupby("good_type"):
+        y = np.vstack(group["labels"].values).astype(np.float32)
+        pos = y.sum(axis=0)
+        stats[str(gt)] = {"count": len(group), "pos": pos}
+        global_pos += pos
+    total_count = len(train_df)
+    return stats, global_pos, total_count
+
+
+def counts_to_logits(pos: np.ndarray, count: int, alpha: float) -> np.ndarray:
+    """Convert positive counts into smoothed logits."""
+    if count <= 0:
+        return np.zeros_like(pos, dtype=np.float32)
+    p = (pos + alpha) / (count + 2.0 * alpha)
+    p = np.clip(p, 1e-6, 1 - 1e-6)
+    return np.log(p / (1 - p))
+
+
+def build_category_prior_logits(
+    stats: Dict[str, Dict[str, np.ndarray]],
+    alpha: float,
+    global_pos: np.ndarray,
+    total_count: int
+) -> Tuple[Dict[str, np.ndarray], Optional[np.ndarray]]:
+    """Build Laplace-smoothed prior logits per good_type plus global fallback."""
+    prior = {gt: counts_to_logits(data["pos"], data["count"], alpha) for gt, data in stats.items()}
+    global_logits = counts_to_logits(global_pos, total_count, alpha) if total_count > 0 else None
+    return prior, global_logits
+
+
+def apply_category_prior_probs(
+    probs: np.ndarray,
+    good_types: List[str],
+    prior_logits_by_type: Dict[str, np.ndarray],
+    weight: float,
+    fallback_logits: Optional[np.ndarray] = None
+) -> np.ndarray:
+    """Blend model probabilities with category prior logits."""
+    if weight <= 0 or not prior_logits_by_type:
+        return probs
+    out = probs.copy()
+    base_logits = logit(out)
+    for i, gt in enumerate(good_types):
+        key = str(gt)
+        logits = prior_logits_by_type.get(key)
+        if logits is None:
+            logits = fallback_logits
+        if logits is None:
+            continue
+        combined = base_logits[i] + weight * logits
+        out[i] = sigmoid(combined)
+    return out
+
+
+def predict_top_k_prior(
+    good_types: List[str],
+    stats: Dict[str, Dict[str, np.ndarray]],
+    global_pos: np.ndarray,
+    top_k: int,
+    num_labels: int
+) -> np.ndarray:
+    """Predict top-K tags per category using frequency prior only."""
+    preds = np.zeros((len(good_types), num_labels), dtype=int)
+    fallback = global_pos if global_pos.sum() > 0 else np.zeros(num_labels, dtype=np.float32)
+    for i, gt in enumerate(good_types):
+        data = stats.get(str(gt))
+        freq = data["pos"] if data is not None else fallback
+        if freq.sum() <= 0:
+            freq = fallback
+        if freq.sum() <= 0:
+            continue
+        k = min(top_k, num_labels)
+        idx = freq.argsort()[-k:]
+        preds[i, idx] = 1
     return preds
 
 
@@ -171,7 +280,9 @@ def save_artifacts(
     mlb,
     global_thr: float,
     per_label_thr: np.ndarray,
-    allowed_tags_by_type: Dict
+    allowed_tags_by_type: Dict,
+    prior_logits_by_type: Dict[str, np.ndarray],
+    prior_alpha: float,
 ):
     """Save model artifacts for inference."""
     import json
@@ -201,7 +312,21 @@ def save_artifacts(
             "max_length": config.data.max_length,
             "stride": config.data.stride,
             "top_k": config.training.top_k,
+            "category_prior_weight": getattr(config.training, "category_prior_weight", 0.0),
         }, f, indent=2)
+
+    with open(artifacts_dir / "category_prior_logits.json", "w", encoding="utf-8") as f:
+        prior_serializable = {k: np.asarray(v, dtype=float).tolist() for k, v in prior_logits_by_type.items()}
+        json.dump(
+            {
+                "smoothing_alpha": prior_alpha,
+                "num_labels": int(len(mlb.classes_)),
+                "prior_logits_by_type": prior_serializable,
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
     
     print(f"✓ Artifacts saved to {artifacts_dir}")
 
@@ -232,6 +357,12 @@ def main():
     
     num_labels = len(mlb.classes_)
     config.model.num_labels = num_labels
+
+    prior_alpha = float(getattr(config.training, "category_prior_smoothing_alpha", 1.0))
+    category_stats, global_prior_pos, total_train_count = compute_category_label_stats(train_df)
+    prior_logits_by_type, global_prior_logits = build_category_prior_logits(
+        category_stats, prior_alpha, global_prior_pos, total_train_count
+    )
     
     print(f"\nLoading model: {config.model.model_name}")
     model = AutoModelForSequenceClassification.from_pretrained(
@@ -306,6 +437,8 @@ def main():
     test_skus = test_df["product_sku"].tolist()
     y_val_true = np.vstack(val_df["labels"].values)
     y_test_true = np.vstack(test_df["labels"].values)
+    val_good_types = val_df["good_type"].astype(str).tolist()
+    test_good_types = test_df["good_type"].astype(str).tolist()
     
     val_sku_list, val_probs = predict_probs_by_sku(trainer, val_ds, num_labels)
     test_sku_list, test_probs = predict_probs_by_sku(trainer, test_ds, num_labels)
@@ -315,45 +448,81 @@ def main():
     
     sku_to_i_test = {s: i for i, s in enumerate(test_sku_list)}
     test_probs_aligned = np.vstack([test_probs[sku_to_i_test[s]] for s in test_skus])
+
+    category_prior_weight = float(getattr(config.training, "category_prior_weight", 0.0))
+    if category_prior_weight != 0:
+        val_probs_with_prior = apply_category_prior_probs(
+            val_probs_aligned, val_good_types, prior_logits_by_type, category_prior_weight, global_prior_logits
+        )
+        test_probs_with_prior = apply_category_prior_probs(
+            test_probs_aligned, test_good_types, prior_logits_by_type, category_prior_weight, global_prior_logits
+        )
+    else:
+        val_probs_with_prior = val_probs_aligned
+        test_probs_with_prior = test_probs_aligned
     
     print("\nApplying category filter...")
     val_probs_filtered = filter_probs_by_good_type(
-        val_probs_aligned, val_df["good_type"].tolist(), mlb, allowed_tags
+        val_probs_with_prior, val_good_types, mlb, allowed_tags
     )
     test_probs_filtered = filter_probs_by_good_type(
-        test_probs_aligned, test_df["good_type"].tolist(), mlb, allowed_tags
+        test_probs_with_prior, test_good_types, mlb, allowed_tags
     )
+
+    print("\n" + "-" * 40)
+    print("CATEGORY PRIOR BASELINE")
+    print("-" * 40)
+    baseline_top_ks = [2, 3]
+    for split_name, y_true, good_types in [
+        ("Val", y_val_true, val_good_types),
+        ("Test", y_test_true, test_good_types),
+    ]:
+        print(f"{split_name}:")
+        for k in baseline_top_ks:
+            baseline_preds = predict_top_k_prior(good_types, category_stats, global_prior_pos, k, num_labels)
+            micro = f1_score(y_true, baseline_preds, average="micro", zero_division=0)
+            print(f"  top{k}: micro_f1={micro:.4f} | avg_pred_tags={avg_predicted_tags(baseline_preds):.2f}")
     
     print("\nTuning thresholds on validation set...")
     best_thr, best_val_f1 = tune_global_threshold(y_val_true, val_probs_filtered)
     print(f"  Global threshold: {best_thr:.3f} (val micro_f1: {best_val_f1:.4f})")
     
     per_label_thr = tune_per_label_thresholds(y_val_true, val_probs_filtered)
+
+    val_pred_global = threshold_predictions(val_probs_filtered, global_thr=best_thr)
+    test_pred_global = threshold_predictions(test_probs_filtered, global_thr=best_thr)
+    val_pred_pl = threshold_predictions(val_probs_filtered, per_label_thr=per_label_thr)
+    test_pred_pl = threshold_predictions(test_probs_filtered, per_label_thr=per_label_thr)
     
     print("\n" + "-" * 40)
     print("TEST RESULTS")
     print("-" * 40)
-    
-    test_pred_global = apply_thresholds(
-        test_probs_filtered, global_thr=best_thr, top_k=config.training.top_k
-    )
-    test_pred_pl = apply_thresholds(
-        test_probs_filtered, per_label_thr=per_label_thr, top_k=config.training.top_k
-    )
     
     print(f"\nGlobal threshold ({best_thr:.3f}):")
     print(f"  micro_f1:  {f1_score(y_test_true, test_pred_global, average='micro', zero_division=0):.4f}")
     print(f"  macro_f1:  {f1_score(y_test_true, test_pred_global, average='macro', zero_division=0):.4f}")
     print(f"  precision: {precision_score(y_test_true, test_pred_global, average='micro', zero_division=0):.4f}")
     print(f"  recall:    {recall_score(y_test_true, test_pred_global, average='micro', zero_division=0):.4f}")
+    print(f"  avg_pred_tags (val):  {avg_predicted_tags(val_pred_global):.2f}")
+    print(f"  avg_pred_tags (test): {avg_predicted_tags(test_pred_global):.2f}")
     
     print(f"\nPer-label thresholds:")
     print(f"  micro_f1:  {f1_score(y_test_true, test_pred_pl, average='micro', zero_division=0):.4f}")
     print(f"  macro_f1:  {f1_score(y_test_true, test_pred_pl, average='macro', zero_division=0):.4f}")
     print(f"  precision: {precision_score(y_test_true, test_pred_pl, average='micro', zero_division=0):.4f}")
     print(f"  recall:    {recall_score(y_test_true, test_pred_pl, average='micro', zero_division=0):.4f}")
+    print(f"  avg_pred_tags (val):  {avg_predicted_tags(val_pred_pl):.2f}")
+    print(f"  avg_pred_tags (test): {avg_predicted_tags(test_pred_pl):.2f}")
     
-    save_artifacts(config, mlb, best_thr, per_label_thr, allowed_tags)
+    save_artifacts(
+        config,
+        mlb,
+        best_thr,
+        per_label_thr,
+        allowed_tags,
+        prior_logits_by_type,
+        prior_alpha,
+    )
     
     print("\n" + "=" * 60)
     print("TRAINING COMPLETE")
@@ -364,4 +533,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
