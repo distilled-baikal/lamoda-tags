@@ -8,6 +8,8 @@ dependencies = [
     "pandas",
     "openai",
     "tqdm",
+    "scikit-learn",
+    "numpy",
 ]
 
 [tool.uv]
