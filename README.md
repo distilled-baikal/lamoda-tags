@@ -8,6 +8,8 @@
 1. **LLM-генерация** — генерация тегов через языковую модель (GPT и др.)
 2. **ML-модель** — обучение классификатора для предсказания тегов (RuBERT)
 
+Дополнительно в репозитории есть **инференс через LoRA-адаптеры (PEFT)** для 5 укрупнённых типов товаров (Bags / Shoes / Clothes / Beauty_Accs / Accs+Home_Accs) поверх одного базового HF-моделя.
+
 ## Установка
 
 ```bash
@@ -235,7 +237,7 @@ LLM видит только 20 коротких кандидатов, поэто
 
 ### Streamlit UI
 
-Простой интерфейс для просмотра товаров, отзывов и тегов модели:
+Простой интерфейс для просмотра товаров, отзывов и тегов модели (по умолчанию без «истинных» тегов в датасете):
 
 ```bash
 streamlit run app.py
@@ -244,9 +246,52 @@ streamlit run app.py
 ![Lamoda Tags Explorer](imgs/app.png)
 
 Приложение:
-- Загружает товары из `lamoda_reviews_sampled_with_pull_tags.csv`.
-- Позволяет выбрать SKU и посмотреть исходные отзывы и «истинные» теги.
-- Показывает предсказания модели с вероятностями, использует те же правила фильтрации по категории и умеет включать LLM-rerank (при наличии `OPENAI_*` переменных).
+- Загружает товары из `lamoda_reviews_sampled.csv` (без колонки `tags`).
+- Позволяет выбрать SKU и посмотреть исходные отзывы.
+- Показывает предсказания тегов с вероятностями.
+- Умеет включать LLM-rerank (при наличии `OPENAI_*` переменных).
+- В сайдбаре можно переключить режим:
+  - **Use LoRA adapters (per-category)** (по умолчанию включено)
+  - выключить и использовать baseline модель `TagPredictor` из `model/output/best_model` (если она есть локально)
+
+#### LoRA-режим (рекомендуется)
+
+Streamlit (и `model/LoraTagPredictor`) берёт:
+- **LoRA-адаптер** по `good_type` из папки `lora_model/`
+- **базовую модель** из локального `hf_models/` (если скачана), иначе попытается взять с HuggingFace Hub.
+
+Маппинг по `good_type`:
+- `Bags` → `lora_bert_output_bags`
+- `Shoes` → `lora_bert_output_shoes`
+- `Clothes` → `lora_bert_output_clothes`
+- `Beauty_Accs` → `lora_bert_output_beauty`
+- `Accs`, `Home_Accs`, и любые другие/неизвестные категории → `lora_bert_output_accs`
+
+##### Скачать LoRA-адаптеры
+
+```bash
+python scripts/download_lora_models.py --out-dir lora_model
+```
+
+Ожидаемая структура:
+
+```
+lora_model/
+  lora_bert_output_bags/
+  lora_bert_output_accs/
+  lora_bert_output_beauty/
+  lora_bert_output_clothes/
+  lora_bert_output_shoes/
+```
+
+##### Скачать базовую HF-модель локально (веса + токенайзер)
+
+```bash
+python scripts/download_hf_model.py --model-id deepvk/user-bge-m3 --local-dir hf_models/user-bge-m3
+```
+
+Важно: в `hf_models/<...>/` должны быть файлы весов (`*.safetensors` или `pytorch_model*.bin`).  
+Если там только `tokenizer.json/config.json`, значит скачался не тот формат (например, sentence-transformers без весов для Transformers).
 
 CLI:
 
@@ -272,7 +317,7 @@ predict-tags --text "Отличные кроссовки, легкие и удо
 | Файл | Описание |
 |------|----------|
 | `lamoda_reviews.csv` | Исходные отзывы (не в репо) |
-| `lamoda_reviews_sampled.csv` | Сгруппированные отзывы |
+| `lamoda_reviews_sampled.csv` | Сгруппированные отзывы (без тегов; используется в Streamlit по умолчанию) |
 | `lamoda_reviews_sampled_with_tags.csv` | Отзывы + LLM теги |
 | `tag_pulls_raw.csv` | Сырой пул тегов |
 | `tag_pulls_best.csv` | Финальный пул тегов |
