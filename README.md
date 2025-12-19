@@ -30,17 +30,16 @@
 
 ### Датасет 
 
-8 тысяч стеков отзывов (all_texts, tags)
+8 тысяч стеков отзывов (all_texts, tags) - `datasets`
 - Разметка тегами от LLM (Qwen 3 4b Instruct) 
 - Получившееся пространство тегов (1000-3000) сводим к топ-30 наиболее информативным и полезными с llm curation + финально human curation 
   - Проблема - нужно замаппить огромный пул сырых тегов для всего датасета в наши эталонные
-  - Решение - смотрим semantic sim сырых тегов с эталонными, оставляем наилучшие `Bags_labels_to_etalon.ipynb` 
-- Можно посмотреть в папке `datasets`
+  - Решение - смотрим semantic sim сырых тегов с эталонными, оставляем наилучшие - `Bags_labels_to_etalon.ipynb` 
 
 ### Преимущества 
 - Очень быстрый инференс
 - Не требует больших ресурсов
-- Выходные теги - всегда качественно сформулированы, имеют высокую полезность 
+- Выходные теги - курируемые, всегда качественно сформулированы, имеют высокую полезность 
 - Можно дообучать, расширять/чистить датасет - итеративно улучшая реально достичь очень высокого качества
 
 ### Возможные улучшения
@@ -55,7 +54,7 @@
 
 - LoRA fine-tuning на 500 – 2 000 примерах
 - Обучение можно найти в `loras_learning`
-- Потери/метрики считаем multilabel (F1, precision@k, recall@k)
+- Потери/метрики считаем multilabel (BCE loss, F1, precision@k, recall@k)
 - Обучение на 3-7 эпохах
 - В среднем F1 на все слои около 0.7
 
@@ -63,7 +62,7 @@
 
 - Вход: аггрегированный текст из отзывов по товару + категория.
 
-- В зависимости от категории включается соответствующий Lora слой.
+- В зависимости от категории маршрутизация на соответствующий Lora слой.
 
 - Он классифицирует от 1 до 6 тегов (threshhold 0.5, можно менять)
 
@@ -100,9 +99,6 @@ streamlit run app.py
 - Загружает товары из `lamoda_reviews_sampled.csv` (без колонки `tags`).
 - Позволяет выбрать SKU и посмотреть исходные отзывы.
 - Показывает предсказания тегов с вероятностями.
-- В сайдбаре можно переключить режим:
-  - **Use LoRA adapters (per-category)** (по умолчанию включено)
-  - выключить и использовать baseline модель `TagPredictor` из `model/output/best_model` (если она есть локально)
 
 #### LoRA-режим
 
@@ -115,12 +111,28 @@ Streamlit (и `model/LoraTagPredictor`) берёт:
 - `Shoes` → `lora_bert_output_shoes`
 - `Clothes` → `lora_bert_output_clothes`
 - `Beauty_Accs` → `lora_bert_output_beauty`
-- `Accs`, `Home_Accs`, и любые другие/неизвестные категории → `lora_bert_output_accs`
+- `Accs` и `Home_Accs` объединены → `lora_bert_output_accs`
+- `Toys` и `Jewellery` не были обучены → `lora_bert_output_accs`
 
 ##### Скачать LoRA-адаптеры
 
 ```bash
 python scripts/download_lora_models.py --out-dir lora_model
+```
+
+Можно также скачать в `All berts__.ipynb` через gdown
+```python
+!gdown 1iXzXQXyHQ-veqCQQbv6WH9vqgJWgpSGz
+!gdown 1hWm6FEF0pMlz8PvTsiYemW3LEIhfBTqm
+!gdown 1zsZWveqfa08nL-pOQJ2VfFSf5ucabk7k
+!gdown 1Js_bwCWCb39-lFWVKzWqFSuq-RmdXeO_
+!gdown 1HW3CUIqOPyXOet_LSwpUQvSN4cfCEf6k
+
+!unzip lora_bert_output_clothes.zip -d lora_bert_output_clothes
+!unzip lora_bert_output_shoes.zip   -d lora_bert_output_shoes
+!unzip lora_bert_output_beauty.zip  -d lora_bert_output_beauty
+!unzip lora_bert_output_accs.zip    -d lora_bert_output_accs
+!unzip lora_bert_output_bags.zip    -d lora_bert_output_bags
 ```
 
 Ожидаемая структура:
