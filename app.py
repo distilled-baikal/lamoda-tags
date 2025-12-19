@@ -10,19 +10,25 @@ import pandas as pd
 import streamlit as st
 
 from model.data import build_text, parse_pylist_or_json, parse_tags_semicolon
+from model.lora_predict import LoraTagPredictor
 from model.predict import TagPredictor
 from model.rerank import LLMReranker
 
-DATA_PATH = Path("lamoda_reviews_sampled_with_pull_tags.csv")
+DATA_PATH = Path("lamoda_reviews_sampled.csv")
 MODEL_DIR = Path("model/output/best_model")
 ARTIFACTS_DIR = Path("model/artifacts")
+LORA_DIR = Path("lora_model")
+HF_MODELS_DIR = Path("hf_models")
 
 
 @st.cache_data(show_spinner=False)
 def load_products(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
     df["comment_list"] = df["comment_text"].apply(parse_pylist_or_json)
-    df["tag_list"] = df["tags"].apply(parse_tags_semicolon)
+    if "tags" in df.columns:
+        df["tag_list"] = df["tags"].apply(parse_tags_semicolon)
+    else:
+        df["tag_list"] = [[] for _ in range(len(df))]
     df["text"] = df.apply(
         lambda r: build_text(
             r.get("name", ""),
@@ -44,6 +50,26 @@ def load_predictor(model_dir: Path, artifacts_dir: Path) -> TagPredictor:
 
 
 @st.cache_resource(show_spinner=False)
+def load_lora_predictor(lora_dir: Path, hf_models_dir: Path) -> LoraTagPredictor:
+    # Lazy-loads specific adapter on first use; keeps bundles cached in-memory.
+    # Prefer local HF weights if present, to avoid any network calls.
+    local_candidates = [
+        hf_models_dir / "user-bge-m3",
+        hf_models_dir / "USER-bge-m3",
+        hf_models_dir / "deepvk_user-bge-m3",
+        hf_models_dir / "deepvk_USER-bge-m3",
+    ]
+    base_model = next((p for p in local_candidates if p.exists()), "deepvk/user-bge-m3")
+    return LoraTagPredictor(
+        lora_root=lora_dir,
+        base_model_name=base_model,
+        device="cpu",
+        threshold=0.5,
+        top_k=8,
+    )
+
+
+@st.cache_resource(show_spinner=False)
 def load_reranker() -> LLMReranker:
     return LLMReranker.from_env()
 
@@ -62,6 +88,11 @@ def main():
     st.caption("Выберите товар, просмотрите отзывы и посмотрите теги модели.")
 
     with st.sidebar:
+        use_lora = st.checkbox(
+            "Use LoRA adapters (per-category)",
+            value=True,
+            help="Загружает LoRA-адаптер по good_type из папки lora_model/ (Bags/Shoes/Clothes/Beauty_Accs/Accs+Home_Accs).",
+        )
         use_llm = st.checkbox("LLM rerank (top-20)", value=False, help="Требуются OPENAI_* переменные")
         st.caption("LLM сверяет top-20 тегов с отзывами и оставляет только релевантные.")
         reranker: Optional[LLMReranker] = None
@@ -93,19 +124,37 @@ def main():
     selected = st.selectbox("Товар", options, index=default_index)
     product = products[products["option_label"] == selected].iloc[0]
 
-    try:
-        predictor = load_predictor(MODEL_DIR, ARTIFACTS_DIR)
-    except Exception as exc:
-        st.error(f"Не удалось загрузить модель: {exc}")
-        return
+    predictor = None
+    lora_predictor = None
+    if use_lora:
+        try:
+            lora_predictor = load_lora_predictor(LORA_DIR, HF_MODELS_DIR)
+        except Exception as exc:
+            st.error(f"Не удалось загрузить LoRA модели: {exc}")
+            return
+    else:
+        try:
+            predictor = load_predictor(MODEL_DIR, ARTIFACTS_DIR)
+        except Exception as exc:
+            st.error(f"Не удалось загрузить модель: {exc}")
+            return
 
-    preds = predictor.predict(
-        product["text"],
-        product["good_type"],
-        llm_reranker=reranker,
-        rerank_top_n=20,
-        rerank_max_output=5,
-    )
+    if use_lora and lora_predictor is not None:
+        preds = lora_predictor.predict(
+            product["text"],
+            product["good_type"],
+            llm_reranker=reranker,
+            rerank_top_n=20,
+            rerank_max_output=5,
+        )
+    else:
+        preds = predictor.predict(
+            product["text"],
+            product["good_type"],
+            llm_reranker=reranker,
+            rerank_top_n=20,
+            rerank_max_output=5,
+        )
 
     col1, col2 = st.columns(2)
     with col1:

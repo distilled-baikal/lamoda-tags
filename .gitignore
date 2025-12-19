@@ -210,3 +210,6 @@ lamoda_reviews.csv
 
 output/
 artifacts/
+
+lora_model
+hf_models

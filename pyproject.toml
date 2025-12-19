@@ -15,6 +15,7 @@ dependencies = [
     "transformers>=4.35",
     "datasets>=2.14",
     "accelerate>=0.24",
+    "peft>=0.10",
     
     # LLM API (for tag generation scripts)
     "openai>=1.0",
