@@ -4,17 +4,17 @@ Simple Streamlit UI for exploring Lamoda products and model tags.
 """
 
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 import pandas as pd
 import streamlit as st
 
-from model.data import build_text, parse_pylist_or_json, parse_tags_semicolon
+from model.data import build_text, parse_pylist_or_json
 from model.lora_predict import LoraTagPredictor
 from model.predict import TagPredictor
 from model.rerank import LLMReranker
 
-DATA_PATH = Path("lamoda_reviews_sampled.csv")
+DATA_PATH = Path("test_examples.csv")
 MODEL_DIR = Path("model/output/best_model")
 ARTIFACTS_DIR = Path("model/artifacts")
 LORA_DIR = Path("lora_model")
@@ -23,25 +23,37 @@ HF_MODELS_DIR = Path("hf_models")
 
 @st.cache_data(show_spinner=False)
 def load_products(path: Path) -> pd.DataFrame:
-    df = pd.read_csv(path)
+    df = pd.read_csv(path, sep=";")
+
+    if "product_sku" not in df.columns or "comment_text" not in df.columns:
+        raise ValueError("CSV must contain at least columns: product_sku, comment_text")
+
     df["comment_list"] = df["comment_text"].apply(parse_pylist_or_json)
-    if "tags" in df.columns:
-        df["tag_list"] = df["tags"].apply(parse_tags_semicolon)
-    else:
-        df["tag_list"] = [[] for _ in range(len(df))]
-    df["text"] = df.apply(
-        lambda r: build_text(
-            r.get("name", ""),
-            r.get("good_type", ""),
-            r.get("good_subtype", ""),
-            r["comment_list"],
-        ),
-        axis=1,
-    )
-    df["option_label"] = df.apply(
-        lambda r: f"{r['product_sku']} — {r.get('name', 'Без названия')}", axis=1
-    )
-    return df
+
+    rows = []
+    for sku, g in df.groupby("product_sku", sort=False):
+        name = g["name"].iloc[0] if "name" in g.columns else ""
+        good_type = g["good_type"].iloc[0] if "good_type" in g.columns else ""
+        good_subtype = g["good_subtype"].iloc[0] if "good_subtype" in g.columns else ""
+
+        comments = []
+        for lst in g["comment_list"].tolist():
+            comments.extend(lst)
+
+        text = build_text(name, good_type, good_subtype, comments)
+        rows.append(
+            {
+                "product_sku": sku,
+                "name": name,
+                "good_type": good_type,
+                "good_subtype": good_subtype,
+                "comment_list": comments,
+                "text": text,
+                "option_label": f"{sku} — {name or 'Без названия'}",
+            }
+        )
+
+    return pd.DataFrame(rows)
 
 
 @st.cache_resource(show_spinner=False)
@@ -72,14 +84,6 @@ def load_lora_predictor(lora_dir: Path, hf_models_dir: Path) -> LoraTagPredictor
 @st.cache_resource(show_spinner=False)
 def load_reranker() -> LLMReranker:
     return LLMReranker.from_env()
-
-
-def render_tag_list(title: str, tags: List[str]) -> None:
-    st.markdown(f"**{title}**")
-    if tags:
-        st.write(", ".join(tags))
-    else:
-        st.write("—")
 
 
 def main():
@@ -159,16 +163,17 @@ def main():
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Информация о товаре")
-        info_html = f"""
-        <div style="border: 1px solid #e5e5e5; border-radius: 8px; padding: 1rem; margin-bottom: 1rem;">
-            <p><strong>SKU:</strong> {product['product_sku']}</p>
-            <p><strong>Название:</strong> {product.get('name', '—')}</p>
-            <p><strong>Категория:</strong> {product.get('good_type', '—')}</p>
-            <p><strong>Подкатегория:</strong> {product.get('good_subtype', '—')}</p>
-        </div>
-        """
-        st.markdown(info_html, unsafe_allow_html=True)
-        render_tag_list("Теги из датасета", product["tag_list"])
+        info_df = pd.DataFrame(
+            [
+                {
+                    "SKU": product["product_sku"],
+                    "Название": product.get("name", "—"),
+                    "Категория": product.get("good_type", "—"),
+                    "Подкатегория": product.get("good_subtype", "—"),
+                }
+            ]
+        )
+        st.table(info_df)
 
     with col2:
         st.subheader("Теги модели")
